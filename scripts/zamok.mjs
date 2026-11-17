@@ -4,14 +4,22 @@
 // иначе логин и пароль лежат в localStorage.
 // Креды: ~/.config/zashchita/login, pass. Без них – падаем, чтобы не выложить открытым.
 // После замка – проверка: в dist не должно остаться ни одного имени и суммы из данных.
+// Второй вход – СВЕРХ админ Артёма (SVERH_LOGIN / SVERH_PASS или ~/.config/sverh-admin/dostup.txt): страница под
+// случайным ключом, его копии – под ключом каждого входа; расшифровка – scripts/admin-open.mjs (копия с Milovini).
+// Нет СВЕРХ – один вход и предупреждение. Схема – ~/Sites/sverh-admin/docs/zamok-dva-vhoda.md.
+//   node scripts/zamok.mjs                         – закрыть свежую сборку dist/index.html
+//   node scripts/zamok.mjs --perevyazat <файл>     – уже закрытую страницу (site/index.html) открыть ключом владельца
+//                                                    и закрыть заново на все входы, содержимое не меняется
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { openBox } from './admin-open.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
-const DIST = path.join(ROOT, 'dist');
-const FILE = path.join(DIST, 'index.html');
+const ARG = process.argv.indexOf('--perevyazat');
+const FILE = ARG > 0 ? path.resolve(process.argv[ARG + 1] || '') : process.env.ZAMOK_FILE || path.join(ROOT, 'dist', 'index.html'); // ZAMOK_FILE – для теста
+const DIST = path.dirname(FILE);
 const ITER = 310000;
 
 function credentials() {
@@ -25,14 +33,39 @@ function credentials() {
   return `${login}\n${pass}`;
 }
 
-function seal(text, secret) {
-  const salt = crypto.randomBytes(16);
-  const iv = crypto.randomBytes(12);
-  const key = crypto.pbkdf2Sync(secret, salt, ITER, 32, 'sha256');
-  const c = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const data = Buffer.concat([c.update(text, 'utf8'), c.final(), c.getAuthTag()]); // WebCrypto ждёт тег в конце
+// СВЕРХ админ: пара или null (как sverhCredentials в admin-crypto.mjs замка админок)
+function sverhSecret() {
+  let login = (process.env.SVERH_LOGIN || '').trim();
+  let pass = (process.env.SVERH_PASS || '').trim();
+  const f = path.join(os.homedir(), '.config', 'sverh-admin', 'dostup.txt');
+  if ((!login || !pass) && fs.existsSync(f)) {
+    const t = fs.readFileSync(f, 'utf8');
+    const line = (k) => ((t.match(new RegExp(`^${k}:[ \\t]*(.*)$`, 'm')) || [])[1] || '').trim();
+    login = line('логин');
+    pass = line('пароль');
+  }
+  if (!login || pass.length < 12) {
+    console.warn('ПРЕДУПРЕЖДЕНИЕ: нет входа СВЕРХ админа (SVERH_LOGIN / SVERH_PASS или ~/.config/sverh-admin/dostup.txt) – страница закрыта одним входом владельца');
+    return null;
+  }
+  return `${login}\n${pass}`;
+}
+
+// Коробка v3 (как makeRing + sealRing в admin-crypto.mjs): данные под случайным ключом, его копии – под каждым входом
+function sealRing(text, secrets) {
   const b = (x) => x.toString('base64');
-  return { iter: ITER, salt: b(salt), iv: b(iv), data: b(data) };
+  const gcm = (key, iv, buf) => {
+    const c = crypto.createCipheriv('aes-256-gcm', key, iv);
+    return Buffer.concat([c.update(buf), c.final(), c.getAuthTag()]); // WebCrypto ждёт тег в конце
+  };
+  const key = crypto.randomBytes(32);
+  const keys = secrets.map((secret) => {
+    const salt = crypto.randomBytes(16);
+    const iv = crypto.randomBytes(12);
+    return { salt: b(salt), iv: b(iv), key: b(gcm(crypto.pbkdf2Sync(secret, salt, ITER, 32, 'sha256'), iv, key)) };
+  });
+  const iv = crypto.randomBytes(12);
+  return { v: 3, iter: ITER, iv: b(iv), data: b(gcm(key, iv, Buffer.from(text, 'utf8'))), keys };
 }
 
 const GATE_CSS = `body{margin:0;background:#f9f9f7;font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:#0b0b0b}
@@ -44,15 +77,13 @@ const GATE_CSS = `body{margin:0;background:#f9f9f7;font:15px/1.45 system-ui,-app
 .login .keep{display:flex;align-items:center;gap:8px;margin:0 0 14px;font-size:14px;cursor:pointer}
 .login .keep input{width:18px;height:18px;margin:0}`;
 
-// innerHTML не выполняет <script> – пересоздаём их после расшифровки
+// openBox – из admin-open.mjs (пара пробуется по всем входам); innerHTML не выполняет <script> – пересоздаём их после расшифровки
 const GATE_JS = `(function(){
 var K='zs_auth',L='zs_keep',box=JSON.parse(document.getElementById('lock-data').textContent),f=document.getElementById('lock-form'),err=f.querySelector('.err');
-function b64(s){return Uint8Array.from(atob(s),function(c){return c.charCodeAt(0)})}
+var openBox=${openBox.toString()};
 async function open(login,pass,quiet,keep){
   try{
-    var base=await crypto.subtle.importKey('raw',new TextEncoder().encode(login+'\\n'+pass),'PBKDF2',false,['deriveKey']);
-    var key=await crypto.subtle.deriveKey({name:'PBKDF2',hash:'SHA-256',salt:b64(box.salt),iterations:box.iter},base,{name:'AES-GCM',length:256},false,['decrypt']);
-    var html=new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:b64(box.iv)},key,b64(box.data)));
+    var html=await openBox(box,login,pass);
   }catch(e){try{sessionStorage.removeItem(K);if(quiet)localStorage.removeItem(L)}catch(_){} if(!quiet)err.textContent='Неверный логин или пароль';return}
   var a=JSON.stringify({login:login,pass:pass});
   try{sessionStorage.setItem(K,a);if(keep)localStorage.setItem(L,a)}catch(_){}
@@ -72,15 +103,21 @@ const gate = (box) => `<body><style>${GATE_CSS}</style>
 <script type="application/json" id="lock-data">${JSON.stringify(box)}</script>
 <script>${GATE_JS}</script></body>`;
 
-if (!fs.existsSync(FILE)) throw new Error('нет dist/index.html – сначала сборка');
+if (!fs.existsSync(FILE)) throw new Error(`нет ${FILE} – сначала сборка`);
 const html = fs.readFileSync(FILE, 'utf8');
-if (html.includes('id="lock-data"')) throw new Error('страница уже закрыта');
+const locked = html.match(/<script type="application\/json" id="lock-data">([\s\S]*?)<\/script>/);
+if (locked && ARG < 0) throw new Error('страница уже закрыта (перевязать на все входы: --perevyazat <файл>)');
+if (!locked && ARG > 0) throw new Error('страница не закрыта – перевязывать нечего');
 const h = html.indexOf('</head>'), b0 = html.indexOf('<body'), b1 = html.lastIndexOf('</body>');
 if (h < 0 || b0 < 0 || b1 < 0) throw new Error('не разобрать страницу');
+const owner = credentials();
+const secrets = [owner, sverhSecret()].filter((x, i, a) => x && a.indexOf(x) === i);
 const headScripts = [];
 const head = html.slice(0, h).replace(/<script\b[\s\S]*?<\/script>/g, (m) => (headScripts.push(m), ''));
-const inner = html.slice(html.indexOf('>', b0) + 1, b1) + headScripts.join('');
-fs.writeFileSync(FILE, head + '</head>' + gate(seal(inner, credentials())) + html.slice(b1 + '</body>'.length));
+const inner = locked
+  ? await openBox(JSON.parse(locked[1]), owner.slice(0, owner.indexOf('\n')), owner.slice(owner.indexOf('\n') + 1))
+  : html.slice(html.indexOf('>', b0) + 1, b1) + headScripts.join('');
+fs.writeFileSync(FILE, head + '</head>' + gate(sealRing(inner, secrets)) + html.slice(b1 + '</body>'.length));
 
 // проверка: в выкладке нет ни одного слова отчёта в открытом виде
 const probes = ['168.113.179.49', 'Ю-Клуб', 'argon2id', 'ispmanager', 'evolutioncarservice', 'Автобалл', '<article', 'Бегет'];
@@ -90,4 +127,4 @@ for (const f of walk(DIST)) {
   const leak = probes.find((p) => text.includes(p));
   if (leak) throw new Error(`утечка в ${path.relative(ROOT, f)}: «${leak}» видно без пароля`);
 }
-console.log(`Страница закрыта, проверено ${probes.length} строк-проб – открытых данных в dist нет`);
+console.log(`Страница закрыта (входов: ${secrets.length}), проверено ${probes.length} строк-проб – открытых данных в dist нет`);
